@@ -1,0 +1,653 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+use lib 'lib';
+use Schema;
+use Data::Dumper;
+
+
+sub traverse {
+  my $dbh = shift;
+  my $result = shift;
+
+  return if $dbh->is_leaf;
+
+  my @children = $dbh->children;
+
+
+  for my $child (@children) {
+    my %child;
+    $child{label} = $child->name;
+    $child{id} = $child->id;
+    $child{type} = $child->type;
+    $child{dataid} =  $child->data_id;
+    push @{$result->{children}}, \%child;
+    traverse($child,\%child);
+  }
+}
+
+##### HELPERS #####
+helper db => sub {
+  return Schema->connect('dbi:SQLite:dbname=devnotes.db');
+};
+
+
+##### PLUGINS #####
+plugin 'Humane' => {
+  theme => 'original'
+};
+
+plugin 'Mojolicious::Plugin::Bcrypt';
+plugin 'Mojolicious::Plugin::Authentication' => {
+
+  load_user => sub {
+
+    my ( $self, $uid ) = @_;
+
+    my $user = $self->db->resultset('User')->find({ id => $uid });
+
+    if ( $user ) {
+      return $user;
+    }
+    else {
+      return;
+    }
+
+  },
+
+  validate_user => sub {
+
+    my ( $self, $username, $password ) = @_;
+
+    my $user = $self->db->resultset('User')->single({ username => $username });
+
+    return unless $user;
+
+    my $salt = substr $password, 0, 2;
+
+    if ( $self->bcrypt_validate( $password, $user->password ) ) {
+      $self->session( user_id => $user->id );
+      $self->session( username => $user->username );
+      return $user->id;
+    }
+    else {
+      return;
+    }
+
+  }
+
+};
+
+get '/' => sub {
+  my $self = shift;
+
+  if ( $self->is_user_authenticated ) {
+    $self->stash(username => $self->session('username'));
+    $self->render('index');
+  }
+  else {
+    $self->render('login');
+  }
+
+};
+
+post '/register' => sub {
+  my $self = shift;
+
+  my $username = $self->param('username');
+  my $password = $self->bcrypt( $self->param('repassword') );
+
+  # Add the user and their / (root) folder
+  $self->db->resultset('User')->create({
+    username => $username,
+    password => $password,
+  });
+
+  $self->redirect_to('/login', username => $username, password => $self->param('repassword') );
+
+};
+
+post '/login' => sub {
+  my $self = shift;
+
+  my $username    = $self->param('username');
+  my $password    = $self->param('password');
+
+  if ( ! $self->authenticate( $username, $password ) ) {
+    $self->humane_flash( 'Invalid credentials!' );
+  }
+  $self->redirect_to('/');
+
+};
+
+post '/logout' => sub {
+  my $self = shift;
+
+  if ( $self->is_user_authenticated ) {
+    delete $self->session->{auth_data};
+    delete $self->stash->{__authentication__};
+  }
+  $self->redirect_to( '/' );
+
+};
+
+get '/sidebar' => sub {
+  my $self = shift;
+
+  my $files = $self->db->resultset('File')->search({
+    user_id   => $self->session('user_id'),
+    parent_id => undef,
+  });
+
+  my @output;
+  while ( my $file = $files->next ) {
+    my %result;
+    $result{label}  = $file->name;
+    $result{id}     = $file->id;
+    $result{type}   = $file->type;
+    $result{dataid} = $file->data_id;
+    push @output, \%result and next if $file->is_leaf;
+
+    # This has children, let's deal with them.
+    traverse($file,\%result);
+    push @output, \%result;
+  }
+
+  $self->render( json => \@output );
+
+};
+
+post '/file' => sub {
+  my $self = shift;
+
+  $self->db->resultset('File')->create({
+    user_id         => $self->session('user_id'),
+    name            => $self->param('name'),
+    type            => $self->param('type'),
+    parent_id       => $self->param('parent_id') // '',
+    data_id         => $self->param('data_id') // '',
+    createdtime     => time,
+    lastmodified    => time,
+  });
+
+  $self->render( text => 'fuck' );
+
+};
+
+put '/file/:id/:name/:parentid' => {parentid => 'NULL'} => sub {
+  my $self = shift;
+
+  my $file = $self->db->resultset('File')->find({ id => $self->param('id') });
+  $file->update({
+    name            => $self->param('name'),
+    parent_id       => $self->param('parentid')
+  });
+};
+
+del '/file' => sub {
+  my $self = shift;
+
+  my $file = $self->db->resultset('File')->find({ id => $self->param('id') });
+  $file->delete;
+};
+
+post '/note' => sub {
+  my $self = shift;
+
+  my $content = $self->param('body');
+
+  $self->render(text => $content);
+
+};
+
+get '/note/:id' => sub {
+  my $self = shift;
+  my $result = $self->db->resultset('Data')->find({ id => $self->param('id') });
+
+  $self->render( text => $result->content, format => 'txt' );
+
+};
+
+put '/note' => sub {
+  my $self = shift;
+};
+
+del '/note' => sub {
+  my $self = shift;
+
+};
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Welcome';
+
+<body>
+  <div id="page-container" class="full-width">
+    <!-- Header -->
+    <header class="navbar navbar-inverse">
+        <!-- div#row -->
+                <div class="row">
+                    <!-- Sidebar Toggle Buttons (Desktop & Tablet) -->
+                    <div class="col-sm-4 hidden-xs">
+                        <ul class="navbar-nav-custom pull-left">
+                            <!-- Desktop Button (Visible only on desktop resolutions) -->
+                            <li class="visible-md visible-lg">
+                                <a href="javascript:void(0)" id="toggle-side-content">
+                                    <i class="icon-reorder"></i>
+                                </a>
+                            </li>
+                            <!-- END Desktop Button -->
+
+                            <!-- Divider -->
+                            <li class="divider-vertical"></li>
+                        </ul>
+                    </div>
+                    <!-- END Sidebar Toggle Buttons -->
+
+                    <!-- Brand and Search Section -->
+                    <div class="col-sm-4 col-xs-12 text-center">
+                        <!-- Top search -->
+                        <form id="top-search" class="pull-left" action="page_ready_search_results.html" method="post">
+                            <input type="text" id="search-term" class="form-control" name="search-term" placeholder="Search..">
+                        </form>
+                        <!-- END Top search -->
+
+                        <!-- Logo -->
+                        <a href="index.html" class="navbar-brand">
+                            <img src="img/template/logo.png" alt="logo">
+                        </a>
+                        <!-- END Logo -->
+
+                        <!-- Loading Indicator, Used for demostrating how loading of notifications could happen, check main.js - uiDemo() -->
+                        <div id="loading" class="display-none"><i class="icon-spinner icon-spin"></i></div>
+                    </div>
+    </header>
+    <!-- END Header -->
+
+    <!-- Left Sidebar -->
+    <aside class="collapse navbar-collapse navbar-main-collapse" id="page-sidebar">
+                <!--
+                Wrapper for scrolling functionality
+                Used only if the .sticky class added above. You can remove it and you will have a sticky sidebar
+                without scrolling enabled when you set the sidebar to be sticky
+                -->
+                <div class="side-scrollable">
+
+                    <!-- Sidebar Tabs -->
+                    <div class="sidebar-tabs-con">
+                        <ul data-toggle="tabs" class="sidebar-tabs">
+                            <li class="active">
+                                <a href="#side-tab-menu"><i class="icon-folder-close"></i></a>
+                            </li>
+                            <li>
+                                <a href="#side-tab-extra"><i class="icon-tags"></i></a>
+                            </li>
+                        </ul>
+                        <div class="tab-content">
+                            <div id="side-tab-menu" class="tab-pane active">
+                                <!-- Primary Navigation -->
+                                <nav id="primary-nav">
+                                    <ul>
+                                        <li>
+                                            <a class="btn btn-new-folder" href="#create-folder" data-toggle="modal"><i class="glyphicon-folder_plus"></i>New Folder</a>
+                                        </li>
+                                </nav>
+                                <div id="side-tab-my-files" data-url="/sidebar/">
+
+                                </div>
+                                <!-- END Primary Navigation -->
+                            </div>
+                            <div id="side-tab-extra" class="tab-pane tab-pane-side">
+
+                            </div>
+                        </div>
+                    </div>
+                    <!-- END Sidebar Tabs -->
+                </div>
+                <!-- END Wrapper for scrolling functionality -->
+            </aside>
+
+    <!-- Page Content -->
+    <div id="page-content">
+
+        <div id="content">
+
+        </div>
+
+        <div class="dropdown">
+
+          <ul id="2" class="dropdown-menu" role="menu">
+            <li><a href="#open_document">Open</a></li>
+            <li><a href="#edit_document">Edit</a></li>
+            <li><a href="#move">Move</a></li>
+            <li><a href="#rename">Rename</a></li>
+            <li><a href="#delete">Delete</a></li>
+            <li><a href="#copy">Copy Link</a></li>
+            <li><a href="#history">History</a></li>
+            <li><a href="#properties">Properties</a></li>
+          </ul>
+
+          <ul id="1" class="dropdown-menu" role="menu">
+            <li><a href="#expand">Expand</a></li>
+            <li><a href="#new">New</a></li>
+            <li><a href="#folder_properties">Properties</a></li>
+          </ul>
+        </div>
+
+    </div>
+    <!-- END Page Content -->
+
+  </div>
+
+  <!-- Modal -->
+  <div id="create-folder" class="modal fade">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <button type="button" class="close" data-dismiss="modal">x</button>
+          <h4>Create Folder</h4>
+        </div>
+        <div class="modal-body">
+          <%= form_for file => (method => 'post') => begin %>
+          <div class="form-group">
+            <div class="col-xs-12">
+              <div class="input-group">
+                <span class="input-group-addon"><i class="icon-folder-close-alt icon-fixed-width"></i></span>
+                <input type="text" id="name" name="name" class="form-control" placeholder="Folder Name">
+                <input type="hidden" id="type" name="type" value="1" />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-danger" data-dismiss="modal">Cancel</button>
+          <button class="btn btn-success" id="createfolder">Create</button>
+        </div>
+        <% end %>
+  </div>
+  <!-- END Modal -->
+
+  <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+  <script src="//cdn.jsdelivr.net/jquery.cookie/1.4.0/jquery.cookie.min.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="js/vendor/jquery-1.9.1.min.js"%3E%3C/script%3E'));</script>
+
+  <!-- Bootstrap.js -->
+  <script src="js/vendor/bootstrap.min.js"></script>
+
+  <!-- Jquery plugins and custom javascript code -->
+  <script src="js/froala_editor.min.js"></script>
+  <script src="js/plugins.js"></script>
+  <script src="js/main.js"></script>
+
+  <script src="js/tree.jquery.js"></script>
+  <script src="js/fuckingtrying.js"></script>
+
+  <script>
+    var $tree = $('#side-tab-my-files');
+    $(document).ready( function() {
+        $tree.tree({
+          saveState: true,
+          onCreateLi: function(node, $li) {
+            if (node.type == 1) {
+              $li.addClass('folder');
+              var $title = $li.find('.jqtree-title');
+              $title.addClass('folder-closed');
+            }
+            else if (node.type == 2) {
+              $li.addClass('document');
+            }
+            else if (node.type == 3) {
+              $li.addClass('link');
+            }
+            else if (node.type == 4) {
+              $li.addClass('source');
+            }
+            else if (node.type == 5) {
+              $li.addClass('snippets');
+            }
+            else {
+              $li.addClass('unknown');
+            }
+          }
+        });
+    });
+
+    function view( id ) {
+      $.get( "/note/" + id, function( data ) {
+        $('#content').html( data );
+        $('#buttons').html('<button class="btn btn-info pull-right" onclick="edit()"><i class="icon-edit"></i> Edit</button>');
+      });
+    }
+
+    function edit() {
+      $('#content').editable({
+        buttons: [ "save", "bold", "italic","strikeThrough", "fontSize", "color", "sep", "formatBlock", "align", "insertOrderedList", "insertUnorderedList", "outdent", "indent", "sep", "selectAll", "createLink", "insertImage", "insertVideo", "undo", "redo", "html"],
+        inlineMode: false,
+        inverseSkin: true,
+        saveURL: '/note'
+      });
+    }
+
+
+    $tree.bind(
+      'tree.click',
+      function(event) {
+        var node = event.node;
+        if (node.type == 1) {
+          $tree.tree('openNode', node);
+          console.log(node.node_class);
+        }
+        if ( node.type == 2 ) {
+          if (node.dataid != null) {
+            view(node.dataid);
+          }
+          else {
+            edit();
+          }
+        }
+      }
+    );
+
+    $tree.jqtreeContextMenu({
+      "new": function (node) { alert('Edit node: ' + node.id); },
+      "delete": function (node) { alert('Delete node: ' + node.name); },
+      "add": function (node) { alert('Add node: ' + node.name); }
+    });
+  </script>
+</body>
+
+
+@@ login.html.ep
+% layout 'default';
+% title  'Login';
+
+<body class="login no-animation">
+  <!-- Login Container -->
+  <div id="login-container">
+      <!-- Login Block -->
+      <div class="block-tabs block-themed">
+          <ul id="login-tabs" class="nav nav-tabs" data-toggle="tabs">
+              <li class="active text-center">
+                  <a href="#login-form-tab">
+                      <i class="icon-user"></i> Login
+                  </a>
+              </li>
+              <li class="text-center">
+                  <a href="#register-form-tab">
+                      <i class="icon-plus"></i> Register
+                  </a>
+              </li>
+          </ul>
+          <div class="tab-content">
+              <div class="tab-pane active" id="login-form-tab">
+                  <!-- Login Form -->
+                  <%= form_for login => (method => 'post') => begin %>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-user icon-fixed-width"></i></span>
+                                  <input type="text" id="username" name="username" class="form-control" placeholder="Username">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="password" name="password" class="form-control" placeholder="Password..">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12 clearfix">
+                              <div class="pull-right">
+                                  <button type="submit" class="btn btn-success remove-margin">Login</button>
+                              </div>
+                          </div>
+                      </div>
+                  <% end %>
+                  <!-- END Login Form -->
+              </div>
+              <div class="tab-pane" id="register-form-tab">
+                  <!-- Register Form -->
+                  <%= form_for register => (method => 'post', id => 'register', name => 'register') => begin %>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-user icon-fixed-width"></i></span>
+                                  <input type="text" id="username" name="username" class="form-control" placeholder="Username">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="register_password" name="register_password" class="form-control" placeholder="Password">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="repassword" name="repassword" class="form-control" placeholder="Retype Password">
+                              </div>
+                          </div>
+                      </div>
+
+                      <div class="form-group">
+                          <div class="col-xs-12 clearfix">
+                              <div class="pull-right">
+                                  <button type="submit" class="btn btn-success remove-margin">Register</button>
+                              </div>
+                          </div>
+                      </div>
+                  <% end %>
+                  <!-- END Register Form -->
+              </div>
+          </div>
+      </div>
+      <!-- END Login Block -->
+  </div>
+  <!-- END Login Container -->
+
+  <!-- Get Jquery library from Google but if something goes wrong get Jquery from local file - Remove 'http:' if you have SSL -->
+  <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="js/vendor/jquery-1.9.1.min.js"%3E%3C/script%3E'));</script>
+
+  <!-- Bootstrap.js -->
+  <script src="js/vendor/bootstrap.min.js"></script>
+
+  <!-- Jquery plugins and custom javascript code -->
+  <script src="js/plugins.js"></script>
+  <script src="js/main.js"></script>
+  <script>
+    $(function() {
+
+      /* Initialize Form Validation */
+      $('#register').validate({
+        errorClass: 'help-block',
+        errorElement: 'span',
+        errorPlacement: function(error, e) {
+          e.parents('.form-group > div').append(error);
+        },
+        highlight: function(e) {
+          $(e).closest('.form-group').removeClass('has-success has-error').addClass('has-error');
+          $(e).closest('.help-block').remove();
+        },
+        success: function(e) {
+          e.closest('.form-group').removeClass('has-success has-error').addClass('has-success');
+          e.closest('.help-block').remove();
+        },
+        rules: {
+          register_password: {
+            required: true,
+            minlength: 5
+          },
+          repassword: {
+            required: true,
+            minlength: 5,
+            equalTo: '#register_password'
+          }
+        },
+        messages: {
+          register_password: {
+            required: 'Please provide a password',
+            minlength: 'Your password must be at least 5 characters long'
+          },
+          repassword: {
+            required: 'Please provide a password',
+            minlength: 'Your password must be at least 5 characters long',
+            equalTo: 'Please enter the same password as above'
+          },
+        }
+      });
+    });
+  </script>
+</body>
+
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+
+    <title>iDevNotes</title>
+
+    <meta name="description" content="A place for developers to easily write and retrieve their notes.">
+    <meta name="author" content="danielamaya">
+    <meta name="robots" content="noindex, nofollow">
+
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1.0">
+
+    <!-- Icons -->
+    <!-- The following icons can be replaced with your own, they are used by desktop and mobile browsers -->
+    <link rel="shortcut icon" href="img/favicon.ico">
+    <!-- END Icons -->
+
+    <!-- Stylesheets -->
+    <!-- The Open Sans font is included from Google Web Fonts -->
+    <link rel="stylesheet" href="http://fonts.googleapis.com/css?family=Open+Sans:300,300italic,400,400italic,700,700italic">
+
+    <!-- Bootstrap is included in its original form, unaltered -->
+    <link rel="stylesheet" href="css/bootstrap.css">
+
+    <!-- Related styles of various icon packs and javascript plugins -->
+    <link rel="stylesheet" href="css/plugins.css">
+
+    <!-- The main stylesheet of this template. All Bootstrap overwrites are defined in here -->
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/jquery.contextmenu.css">
+    <link rel="stylesheet" href="css/jqtree.css">
+    <link href="css/font-awesome.min.css" rel="stylesheet" type="text/css">
+    <link href="css/froala_editor.min.css" rel="stylesheet" type="text/css">
+
+    </head>
+    <%= content %>
+</html>
+

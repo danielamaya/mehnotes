@@ -1,0 +1,582 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+use lib 'lib';
+use Schema;
+use Data::Dumper;
+
+##### HELPERS #####
+helper db => sub {
+  return Schema->connect('dbi:Pg:dbname=devnotes', 'devnotes', 'devnotes123');
+};
+
+
+##### PLUGINS #####
+plugin 'Humane' => {
+  theme => 'original'
+};
+
+plugin 'Mojolicious::Plugin::Bcrypt';
+plugin 'Mojolicious::Plugin::Authentication' => {
+
+  load_user => sub {
+
+    my ( $self, $uid ) = @_;
+
+    my $user = $self->db->resultset('User')->find({ id => $uid });
+
+    if ( $user ) {
+      return $user;
+    }
+    else {
+      return;
+    }
+
+  },
+
+  validate_user => sub {
+
+    my ( $self, $username, $password ) = @_;
+
+    my $user = $self->db->resultset('User')->single({ username => $username });
+
+    return unless $user;
+
+    my $salt = substr $password, 0, 2;
+
+    if ( $self->bcrypt_validate( $password, $user->password ) ) {
+        $self->session( user_id => $user->id );
+        $self->session( username => $user->username );
+        return $user->id;
+    }
+    else {
+        return;
+    }
+
+  }
+
+};
+
+get '/' => sub {
+  my $self = shift;
+
+  if ( $self->is_user_authenticated ) {
+    $self->stash(username => $self->session('username'));
+    $self->render('index');
+  }
+  else {
+    $self->render('login');
+  }
+
+};
+
+post '/register' => sub {
+  my $self = shift;
+
+  my $username = $self->param('username');
+  my $password = $self->bcrypt( $self->param('repassword') );
+
+  # Add the user and their / (root) folder
+  $self->db->resultset('User')->create({
+    username => $username,
+    password => $password,
+    folders => [ { name => '/' } ],
+  });
+
+  $self->redirect_to('/login', username => $username, password => $self->param('repassword') );
+
+};
+
+post '/login' => sub {
+  my $self = shift;
+
+  my $username    = $self->param('username');
+  my $password    = $self->param('password');
+
+  if ( ! $self->authenticate( $username, $password ) ) {
+    $self->humane_flash( 'Invalid credentials!' );
+  }
+  $self->redirect_to('/');
+
+};
+
+post '/logout' => sub {
+  my $self = shift;
+
+  if ( $self->is_user_authenticated ) {
+      delete $self->session->{auth_data};
+      delete $self->stash->{__authentication__};
+  }
+  $self->redirect_to( '/' );
+
+};
+
+post 'sidebar' => sub {
+  my $self = shift;
+
+  my $folder_id = $self->param('dir');
+  my $user_id = $self->session('user_id');
+
+  my $folders;
+  my $html = '<ul class="jqueryFileTree" style="display: none;">';
+  if ( $folder_id eq $self->session('username') ) {
+
+    my $user_id = $self->session('user_id');
+    $folders = $self->db->resultset('Folder')->search(
+      {
+        user_id   => $user_id,
+        parent_id => undef,
+      }
+    );
+    while( my $result = $folders->next ) {
+      $html .= '<li class="directory collapsed">'.
+                  '<a href="#" class="folder" rel="'.$result->id.'">'.
+                    $result->name.
+                  '</a>'.
+                '</li>';
+    }
+    $html .= '</ul>';
+
+  }
+  else {
+    $folders = $self->db->resultset('Folder')->search(
+      {
+        parent_id => $folder_id,
+      }
+    );
+
+    while ( my $result = $folders->next ) {
+
+      $html .= '<li class="directory collapsed">'.
+                  '<a href="#" class="folder" rel="'.$result->id.'">'.
+                    $result->name.
+                  '</a>'.
+                '</li>';
+    }
+
+    my $files = $self->db->resultset('File')->search(
+      {
+        folder_id => $folder_id
+      }
+    );
+
+    $html .= '<ul class="jqueryFileTree" style="display: block;">';
+    while ( my $result = $files->next ) {
+      $html .= '<li class="file ext_txt">'.
+                 '<a href="#" rel="'.$result->id.'">'.
+                    $result->name.
+                  '</a>'.
+                '</li>';
+    }
+    $html .= '</ul></li>';
+    # }
+    # $html .= '</ul>';
+  }
+
+  $self->render( text => $html, format => 'txt');
+
+};
+
+group {
+
+  under '/note';
+
+  get '/view/:id' => sub {
+    my $self = shift;
+
+    my $result = $self->db->resultset('File')->find({ id => $self->param('id') });
+    $self->render( json => [ $result->all ] );
+  };
+
+  post '/create/:folder_id/:name' => sub {
+    my $self = shift;
+
+    $self->db->resultset('File')->create({
+      folder_id => $self->param('folder_id'),
+      name => $self->param('name'),
+    });
+  };
+
+  put '/update/:id/*body' => sub {
+    my $self = shift;
+
+    my $now = '10/03/2014 12:30:23';
+    my $note = $self->db->resultset('File')->find({ id => $self->param('id') });
+
+    $note->update({
+      body          => $self->param('body'),
+      last_modified => $now,
+    });
+
+  };
+
+  del '/delete/:id' => sub {
+    my $self = shift;
+
+    my $note = $self->db->resultset('File')->find({ id => $self->param('id') });
+    $note->delete;
+
+  };
+
+};
+
+group {
+
+  under '/folder';
+
+  post '/create/:folder_id/:name' => sub {
+    my $self = shift;
+
+    $self->db->resultset('Folder')->create({
+      folder_id => $self->param('folder_id'),
+      name => $self->param('name'),
+    });
+  };
+
+  del '/delete/:id' => sub {
+    my $self = shift;
+
+    my $note = $self->db->resultset('File')->find({ id => $self->param('id') });
+    $note->delete;
+
+  };
+
+};
+
+
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Welcome';
+
+<body>
+  <div id="page-container" class="full-width">
+    <!-- Header -->
+    <header class="navbar navbar-inverse">
+        <!-- div#row -->
+        <div class="row">
+            <!-- Sidebar Toggle Buttons (Desktop & Tablet) -->
+            <div class="col-sm-4 hidden-xs">
+                <ul class="navbar-nav-custom pull-left">
+                    <!-- Desktop Button (Visible only on desktop resolutions) -->
+                    <li class="visible-md visible-lg">
+                        <a href="javascript:void(0)" id="toggle-side-content">
+                            <i class="icon-reorder"></i>
+                        </a>
+                    </li>
+                    <!-- END Desktop Button -->
+
+                    <!-- Divider -->
+                    <li class="divider-vertical"></li>
+                </ul>
+            </div>
+            <!-- END Sidebar Toggle Buttons -->
+
+            <!-- Brand and Search Section -->
+            <div class="col-sm-8 col-xs-12 text-center">
+                <!-- Top search -->
+                <form id="top-search" class="pull-right" action="page_ready_search_results.html" method="post">
+                    <input type="text" id="search-term" class="form-control" name="search-term" placeholder="Search..">
+                </form>
+                <!-- END Top search -->
+            </div>
+            <!-- END Brand and Search Section -->
+
+            <!-- Header Nav Section -->
+            <div id="header-nav-section" class="col-sm-4 col-xs-12 clearfix">
+            </div>
+    </header>
+    <!-- END Header -->
+
+    <!-- Left Sidebar -->
+    <aside id="page-sidebar" class="collapse navbar-collapse navbar-main-collapse">
+        <div class="side-scrollable">
+            <div class="sidebar-tabs-con">
+                <div class="tab-content">
+                    <a href="#modal-create-folder" class="btn btn-default" data-toggle="modal" style="margin-bottom:5px;">
+                      <i class="icon-plus"></i> Create Folder
+                    </a>
+                    <div class="tab-pane active" id="side-tab-my-files">
+
+                    </div>
+                </div>
+            </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Page Content -->
+    <div id="page-content">
+        <ul>
+            <li class="directory collapsed"><a href="#" class="folder" rel="77">shit</a></li>
+        </ul>
+    </div>
+    <!-- END Page Content -->
+
+  </div>
+
+  <!-- Modal -->
+  <div id="modal-create-folder" class="modal fade">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <button type="button" class="close" data-dismiss="modal">x</button>
+          <h4>Create Folder</h4>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <div class="col-xs-12">
+              <div class="input-group">
+                <span class="input-group-addon"><i class="icon-folder-close-alt icon-fixed-width"></i></span>
+                <input type="text" id="foldername" name="foldername" class="form-control" placeholder="Folder Name">
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-danger" data-dismiss="modal">Cancel</button>
+          <button class="btn btn-success" id="createfolder">Create</button>
+        </div>
+  </div>
+  <!-- END Modal -->
+
+  <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="js/vendor/jquery-1.9.1.min.js"%3E%3C/script%3E'));</script>
+
+  <!-- Bootstrap.js -->
+  <script src="js/vendor/bootstrap.min.js"></script>
+
+  <!-- Jquery plugins and custom javascript code -->
+  <script src="js/plugins.js"></script>
+  <script src="js/main.js"></script>
+
+
+  <script src="js/jquery.contextmenu.js"></script>
+  <script src="js/jqueryFileTree.js"></script>
+  <script>
+    $(document).ready( function() {
+        $('#side-tab-my-files').fileTree( {
+            root: '<%= $username %>',
+            script: '/sidebar',
+            directoryMenu: [
+              items: [
+                { label: 'Create File', icon: 'icons/notebook--plus.png', action: function() { console.log('create_file') } },
+                { label: 'Rename',      icon: 'icons/folder-rename.png', action: function() { console.log('create_file') } },
+                { label: 'Delete', icon: 'icons/folder--minus.png', action: function() { console.log('create_file') } },
+                { label: 'Download', icon: 'icons/download-cloud.png', action: function() { console.log('create_file') } }
+              ]
+            ]
+          },
+          function(file) {
+            alert(file);
+        );
+        $('#createfolder').on('click', function() {
+            console.log('shit');
+        });
+    //});
+    //function createMenus() {
+        $('.directory').contextPopup({
+            items: [
+                { label: 'Create File', icon: 'icons/notebook--plus.png', action: function() { console.log('create_file') } },
+                { label: 'Rename',      icon: 'icons/folder-rename.png', action: function() { console.log('create_file') } },
+                { label: 'Delete', icon: 'icons/folder--minus.png', action: function() { console.log('create_file') } },
+                { label: 'Download', icon: 'icons/download-cloud.png', action: function() { console.log('create_file') } }
+            ]
+        });
+     //}
+    });
+  </script>
+</body>
+
+@@ login.html.ep
+% layout 'default';
+% title  'Login';
+
+<body class="login no-animation">
+  <!-- Login Container -->
+  <div id="login-container">
+      <!-- Login Block -->
+      <div class="block-tabs block-themed">
+          <ul id="login-tabs" class="nav nav-tabs" data-toggle="tabs">
+              <li class="active text-center">
+                  <a href="#login-form-tab">
+                      <i class="icon-user"></i> Login
+                  </a>
+              </li>
+              <li class="text-center">
+                  <a href="#register-form-tab">
+                      <i class="icon-plus"></i> Register
+                  </a>
+              </li>
+          </ul>
+          <div class="tab-content">
+              <div class="tab-pane active" id="login-form-tab">
+                  <!-- Login Form -->
+                  <%= form_for login => (method => 'post') => begin %>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-user icon-fixed-width"></i></span>
+                                  <input type="text" id="username" name="username" class="form-control" placeholder="Username">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="password" name="password" class="form-control" placeholder="Password..">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12 clearfix">
+                              <div class="pull-right">
+                                  <button type="submit" class="btn btn-success remove-margin">Login</button>
+                              </div>
+                          </div>
+                      </div>
+                  <% end %>
+                  <!-- END Login Form -->
+              </div>
+              <div class="tab-pane" id="register-form-tab">
+                  <!-- Register Form -->
+                  <%= form_for register => (method => 'post', id => 'register', name => 'register') => begin %>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-user icon-fixed-width"></i></span>
+                                  <input type="text" id="username" name="username" class="form-control" placeholder="Username">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="register_password" name="register_password" class="form-control" placeholder="Password">
+                              </div>
+                          </div>
+                      </div>
+                      <div class="form-group">
+                          <div class="col-xs-12">
+                              <div class="input-group">
+                                  <span class="input-group-addon"><i class="icon-asterisk icon-fixed-width"></i></span>
+                                  <input type="password" id="repassword" name="repassword" class="form-control" placeholder="Retype Password">
+                              </div>
+                          </div>
+                      </div>
+
+                      <div class="form-group">
+                          <div class="col-xs-12 clearfix">
+                              <div class="pull-right">
+                                  <button type="submit" class="btn btn-success remove-margin">Register</button>
+                              </div>
+                          </div>
+                      </div>
+                  <% end %>
+                  <!-- END Register Form -->
+              </div>
+          </div>
+      </div>
+      <!-- END Login Block -->
+  </div>
+  <!-- END Login Container -->
+
+  <!-- Get Jquery library from Google but if something goes wrong get Jquery from local file - Remove 'http:' if you have SSL -->
+  <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.min.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="js/vendor/jquery-1.9.1.min.js"%3E%3C/script%3E'));</script>
+
+  <!-- Bootstrap.js -->
+  <script src="js/vendor/bootstrap.min.js"></script>
+
+  <!-- Jquery plugins and custom javascript code -->
+  <script src="js/plugins.js"></script>
+  <script src="js/main.js"></script>
+  <script>
+    $(function() {
+
+      /* Initialize Form Validation */
+      $('#register').validate({
+        errorClass: 'help-block',
+        errorElement: 'span',
+        errorPlacement: function(error, e) {
+          e.parents('.form-group > div').append(error);
+        },
+        highlight: function(e) {
+          $(e).closest('.form-group').removeClass('has-success has-error').addClass('has-error');
+          $(e).closest('.help-block').remove();
+        },
+        success: function(e) {
+          e.closest('.form-group').removeClass('has-success has-error').addClass('has-success');
+          e.closest('.help-block').remove();
+        },
+        rules: {
+          register_password: {
+            required: true,
+            minlength: 5
+          },
+          repassword: {
+            required: true,
+            minlength: 5,
+            equalTo: '#register_password'
+          }
+        },
+        messages: {
+          register_password: {
+            required: 'Please provide a password',
+            minlength: 'Your password must be at least 5 characters long'
+          },
+          repassword: {
+            required: 'Please provide a password',
+            minlength: 'Your password must be at least 5 characters long',
+            equalTo: 'Please enter the same password as above'
+          },
+        }
+      });
+    });
+  </script>
+</body>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+
+    <title>iDevNotes</title>
+
+    <meta name="description" content="A place for developers to easily write and retrieve their notes.">
+    <meta name="author" content="danielamaya">
+    <meta name="robots" content="noindex, nofollow">
+
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1.0">
+
+    <!-- Icons -->
+    <!-- The following icons can be replaced with your own, they are used by desktop and mobile browsers -->
+    <link rel="shortcut icon" href="img/favicon.ico">
+    <!-- END Icons -->
+
+    <!-- Stylesheets -->
+    <!-- The Open Sans font is included from Google Web Fonts -->
+    <link rel="stylesheet" href="http://fonts.googleapis.com/css?family=Open+Sans:300,300italic,400,400italic,700,700italic">
+
+    <!-- Bootstrap is included in its original form, unaltered -->
+    <link rel="stylesheet" href="css/bootstrap.css">
+
+    <!-- Related styles of various icon packs and javascript plugins -->
+    <link rel="stylesheet" href="css/plugins.css">
+
+    <!-- The main stylesheet of this template. All Bootstrap overwrites are defined in here -->
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/jquery.contextmenu.css">
+    <link rel="stylesheet" href="css/jqueryFileTree.css">
+
+    <script src="js/vendor/modernizr-2.6.2-respond-1.1.0.min.js"></script>
+    </head>
+    <%= content %>
+</html>
+
